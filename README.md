@@ -1,5 +1,7 @@
 # 🍜 Alphabet Soup
 
+**Live:** [alphabetsoup.carterpry.com](https://alphabetsoup.carterpry.com) ([alphabetsoup.pages.dev](https://alphabetsoup.pages.dev))
+
 A bowl of orange broth full of pasta letters you can push around. Built on
 [@chenglou/pretext](https://github.com/chenglou/pretext) — text measurement &
 layout with zero DOM reflows — everything renders on a single canvas.
