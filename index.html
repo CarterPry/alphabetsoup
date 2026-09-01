@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Alphabet Soup</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍜</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #e8641b; }
+  canvas { display: block; touch-action: none; cursor: grab; }
+  canvas.grabbing { cursor: grabbing; }
+</style>
+</head>
+<body>
+<canvas id="soup"></canvas>
+<script type="module">
+// ---------------------------------------------------------------------------
+// ALPHABET SOUP — canvas toy built on @chenglou/pretext (text measurement
+// & layout without the DOM). pretext gives us:
+//   • per-glyph natural widths  -> accurate drag hit-boxes & letter centering
+//   • prefix advances of a word -> properly kerned "spell tray" slot layout
+//   • layoutWithLines           -> wrapped, centered HUD copy on canvas
+// ---------------------------------------------------------------------------
+
+let P; // pretext module
+try {
+  P = await import('https://esm.sh/@chenglou/pretext@0.0.8');
+} catch {
+  // offline fallback: shim the tiny slice of the API we use with canvas metrics
+  const mctx = document.createElement('canvas').getContext('2d');
+  const measure = (text, font) => { mctx.font = font; return mctx.measureText(text).width; };
+  P = {
+    prepareWithSegments: (text, font) => ({ text, font }),
+    measureNaturalWidth: (p) => measure(p.text, p.font),
+    layoutWithLines: (p, maxWidth, lineHeight) => {
+      const words = p.text.split(' '); const lines = []; let cur = '';
+      for (const w of words) {
+        const next = cur ? cur + ' ' + w : w;
+        if (measure(next, p.font) > maxWidth && cur) { lines.push(cur); cur = w; }
+        else cur = next;
+      }
+      if (cur) lines.push(cur);
+      return { lineCount: lines.length, height: lines.length * lineHeight,
+               lines: lines.map(t => ({ text: t, width: measure(t, p.font) })) };
+    },
+    clearCache: () => {},
+  };
+}
+
+const FONT_FAMILY = 'Fredoka, "Comic Sans MS", sans-serif';
+const canvas = document.getElementById('soup');
+const ctx = canvas.getContext('2d');
+
+// wait for the real font before pretext measures anything, then drop stale cache
+await Promise.allSettled([
+  document.fonts.load(`700 64px Fredoka`),
+  document.fonts.load(`500 16px Fredoka`),
+]);
+await document.fonts.ready;
+P.clearCache();
+
+// --- pretext-backed glyph measurement (cached) -----------------------------
+const glyphCache = new Map();
+function glyphWidth(ch, size, weight = 700) {
+  const key = ch + '|' + size + '|' + weight;
+  let w = glyphCache.get(key);
+  if (w === undefined) {
+    w = P.measureNaturalWidth(P.prepareWithSegments(ch, `${weight} ${size}px ${FONT_FAMILY}`));
+    glyphCache.set(key, w);
+  }
+  return w;
+}
+// pre-rendered letter sprites: hundreds of live fillText/strokeText calls per
+// frame are too slow, so each (char, quantized size, cream shade) renders once
+// to an offscreen canvas and is drawImage'd thereafter
+const CREAMS = ['hsl(44 82% 86%)', 'hsl(44 82% 89%)', 'hsl(46 80% 91%)', 'hsl(42 78% 93%)'];
+const spriteCache = new Map();
+function letterSprite(ch, size, fill) {
+  const q = Math.max(6, Math.round(size / 6) * 6);   // quantize for cache hits
+  const key = ch + '|' + q + '|' + fill;
+  let s = spriteCache.get(key);
+  if (!s) {
+    const gw = glyphWidth(ch, q);                    // pretext glyph width
+    const pad = q * 0.4;
+    const w = gw + pad * 2, h = q * 1.4 + pad;
+    const cv = document.createElement('canvas');
+    cv.width = Math.ceil(w * DPR); cv.height = Math.ceil(h * DPR);
+    const c = cv.getContext('2d');
+    c.scale(DPR, DPR);
+    c.font = `700 ${q}px ${FONT_FAMILY}`;
+    c.textBaseline = 'middle';
+    const cx = pad, cy = h / 2;
+    c.fillStyle = 'rgba(130,45,0,0.30)';             // broth shadow
+    c.fillText(ch, cx + 3, cy + 4);
+    c.lineWidth = Math.max(q * 0.055, 1.5);
+    c.strokeStyle = 'rgba(200,130,40,0.55)';         // pasta edge
+    c.strokeText(ch, cx, cy);
+    c.fillStyle = fill;
+    c.fillText(ch, cx, cy);
+    c.fillStyle = 'rgba(255,255,255,0.22)';          // gloss
+    c.fillText(ch, cx - q * 0.02, cy - q * 0.035);
+    s = { cv, w, h, size: q, ox: pad + gw / 2, oy: cy }; // glyph center offset
+    spriteCache.set(key, s);
+  }
+  return s;
+}
+// kerned prefix advances for the spell tray: advance up to (and incl.) char i
+function prefixAdvances(word, size) {
+  const font = `700 ${size}px ${FONT_FAMILY}`;
+  const out = [0];
+  for (let i = 1; i <= word.length; i++) {
+    out.push(P.measureNaturalWidth(P.prepareWithSegments(word.slice(0, i), font)));
+  }
+  return out;
+}
+
+// --- state ------------------------------------------------------------------
+let W = 0, H = 0, DPR = 1, brothGrad = null;
+const letters = [];   // {ch,size,x,y,vx,vy,rot,vrot,phase,fill,inTray,dispSize}
+const bits = [];      // carrots & herbs
+const ripples = [];
+const tray = [];      // subset of letters, in word order
+let traySlots = [];
+let trayBounds = null;
+let grabbed = null, grabDX = 0, grabDY = 0;
+let pointer = { x: 0, y: 0, px: 0, py: 0, down: false };
+const TRAY_SIZE = 46;
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  spriteCache.clear();                               // DPR may have changed
+  brothGrad = ctx.createRadialGradient(W * 0.5, H * 0.42, 0, W * 0.5, H * 0.5, Math.max(W, H) * 0.75);
+  brothGrad.addColorStop(0, '#ff9d42');
+  brothGrad.addColorStop(0.55, '#f07c22');
+  brothGrad.addColorStop(1, '#cf5a10');
+  computeTraySlots();
+}
+window.addEventListener('resize', resize);
+resize();
+
+function spawnLetters() {
+  const target = Math.round(Math.min(Math.max((W * H) / 2400, 320), 720));
+  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const pool = [];
+  while (pool.length < target) pool.push(...alpha.split('').sort(() => Math.random() - 0.5));
+  for (let i = 0; i < target; i++) {
+    const ch = pool[i];
+    const size = rand(20, 54);
+    letters.push({
+      ch, size, dispSize: size,
+      r: Math.max(glyphWidth(ch, size), size) * 0.48, // cached: keeps the n² loop cheap
+      x: rand(60, W - 60), y: rand(90, H - 60),
+      vx: rand(-20, 20), vy: rand(-20, 20),
+      rot: rand(-0.6, 0.6), vrot: rand(-0.3, 0.3),
+      phase: rand(0, Math.PI * 2),
+      fill: CREAMS[(Math.random() * CREAMS.length) | 0],
+      inTray: false,
+    });
+  }
+  for (let i = 0; i < 14; i++) {
+    bits.push({ kind: i % 3 === 0 ? 'herb' : 'carrot',
+      x: rand(0, W), y: rand(0, H), r: rand(4, 11),
+      rot: rand(0, Math.PI * 2), phase: rand(0, Math.PI * 2),
+      speed: rand(4, 12) });
+  }
+}
+spawnLetters();
+
+const letterR = (L) => L.r;
+
+// --- spell tray --------------------------------------------------------------
+function computeTraySlots() {
+  traySlots = [];
+  trayBounds = null;
+  if (!tray.length) return;
+  // wrap into rows: pretext measures each candidate row's kerned width
+  const font = `700 ${TRAY_SIZE}px ${FONT_FAMILY}`;
+  const maxW = Math.max(200, W - 120);
+  const rows = [];
+  let row = [];
+  for (const L of tray) {
+    const word = row.map(l => l.ch).join('') + L.ch;
+    if (row.length && P.measureNaturalWidth(P.prepareWithSegments(word, font)) > maxW) {
+      rows.push(row); row = [L];
+    } else row.push(L);
+  }
+  rows.push(row);
+  const rowH = TRAY_SIZE * 1.18;
+  let minX = Infinity, maxX = -Infinity;
+  rows.forEach((r, ri) => {
+    const word = r.map(l => l.ch).join('');
+    const pre = prefixAdvances(word, TRAY_SIZE);     // pretext kerned advances
+    const total = pre[word.length];
+    const x0 = W / 2 - total / 2;
+    const y = 84 + ri * rowH;
+    r.forEach((_, i) => traySlots.push({ x: x0 + (pre[i] + pre[i + 1]) / 2, y }));
+    if (x0 < minX) minX = x0;
+    if (x0 + total > maxX) maxX = x0 + total;
+  });
+  trayBounds = { x: minX - 30, y: 84 - rowH / 2 - 4,
+                 w: maxX - minX + 60, h: rows.length * rowH + 8 };
+}
+function trayAdd(ch) {
+  let pick = null, best = Infinity;
+  for (const L of letters) {
+    if (L.inTray || L === grabbed) continue;
+    if (L.ch !== ch) continue;
+    const d = (L.x - W / 2) ** 2 + (L.y - 84) ** 2;
+    if (d < best) { best = d; pick = L; }
+  }
+  if (!pick) { // soup magic: morph a random free noodle into the needed letter
+    const free = letters.filter(L => !L.inTray && L !== grabbed);
+    if (!free.length) return;
+    pick = free[(Math.random() * free.length) | 0];
+    pick.ch = ch;
+    pick.r = Math.max(glyphWidth(ch, pick.size), pick.size) * 0.48;
+  }
+  pick.inTray = true;
+  tray.push(pick);
+  computeTraySlots();
+}
+function trayRelease(L) {
+  const i = tray.indexOf(L);
+  if (i === -1) return;
+  tray.splice(i, 1);
+  L.inTray = false;
+  L.vx = rand(-60, 60); L.vy = rand(40, 140);
+  L.vrot = rand(-1.5, 1.5);
+  computeTraySlots();
+  splash(L.x, L.y, 0.7);
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key;
+  if (/^[a-zA-Z]$/.test(k)) { trayAdd(k.toUpperCase()); e.preventDefault(); }
+  else if (k === 'Backspace') { if (tray.length) trayRelease(tray[tray.length - 1]); e.preventDefault(); }
+  else if (k === 'Escape') { while (tray.length) trayRelease(tray[tray.length - 1]); }
+  else if (k === ' ') { // scatter!
+    for (const L of letters) {
+      if (L.inTray) continue;
+      const a = Math.atan2(L.y - H / 2, L.x - W / 2) + rand(-0.5, 0.5);
+      const p = rand(200, 520);
+      L.vx += Math.cos(a) * p; L.vy += Math.sin(a) * p;
+      L.vrot += rand(-4, 4);
+    }
+    splash(W / 2, H / 2, 3);
+    e.preventDefault();
+  }
+});
+
+// --- pointer -----------------------------------------------------------------
+function splash(x, y, s = 1) {
+  ripples.push({ x, y, r: 6 * s, v: 160 * s, a: 0.5 });
+  if (ripples.length > 24) ripples.shift();
+}
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.setPointerCapture(e.pointerId);
+  pointer.down = true;
+  pointer.x = pointer.px = e.clientX; pointer.y = pointer.py = e.clientY;
+  // topmost letter first (letters render in array order; grabbed renders last)
+  for (let i = letters.length - 1; i >= 0; i--) {
+    const L = letters[i];
+    const hw = glyphWidth(L.ch, L.dispSize) / 2 + 8;   // pretext hit-box
+    const hh = L.dispSize * 0.55 + 8;
+    const dx = e.clientX - L.x, dy = e.clientY - L.y;
+    const c = Math.cos(-L.rot), s = Math.sin(-L.rot);
+    const lx = dx * c - dy * s, ly = dx * s + dy * c;
+    if (Math.abs(lx) < hw && Math.abs(ly) < hh) {
+      if (L.inTray) trayRelease(L);
+      grabbed = L; grabDX = dx; grabDY = dy;
+      // pop to top of draw order
+      letters.splice(i, 1); letters.push(L);
+      canvas.classList.add('grabbing');
+      splash(L.x, L.y, 0.8);
+      return;
+    }
+  }
+  splash(e.clientX, e.clientY, 1.2);
+});
+canvas.addEventListener('pointermove', (e) => {
+  pointer.px = pointer.x; pointer.py = pointer.y;
+  pointer.x = e.clientX; pointer.y = e.clientY;
+  if (grabbed) {
+    grabbed.vx = (pointer.x - pointer.px) * 60;
+    grabbed.vy = (pointer.y - pointer.py) * 60;
+  } else if (pointer.down) {
+    // stirring: push nearby letters along the pointer's motion
+    const mx = pointer.x - pointer.px, my = pointer.y - pointer.py;
+    for (const L of letters) {
+      if (L.inTray) continue;
+      const d2 = (L.x - pointer.x) ** 2 + (L.y - pointer.y) ** 2;
+      if (d2 < 140 * 140) {
+        const f = 1 - Math.sqrt(d2) / 140;
+        L.vx += mx * 14 * f; L.vy += my * 14 * f;
+        L.vrot += (mx - my) * 0.01 * f;
+      }
+    }
+  }
+});
+function release() {
+  pointer.down = false;
+  if (grabbed) { splash(grabbed.x, grabbed.y, 1); grabbed = null; }
+  canvas.classList.remove('grabbing');
+}
+canvas.addEventListener('pointerup', release);
+canvas.addEventListener('pointercancel', release);
+
+// --- simulation ---------------------------------------------------------------
+function step(dt, t) {
+  for (const L of letters) {
+    if (L === grabbed) {
+      L.x = pointer.x - grabDX; L.y = pointer.y - grabDY;
+      L.rot *= 0.85;
+      L.dispSize += (L.size * 1.12 - L.dispSize) * 0.25;
+      continue;
+    }
+    if (L.inTray) {
+      const slot = traySlots[tray.indexOf(L)];
+      if (slot) {
+        L.x += (slot.x - L.x) * Math.min(1, dt * 9);
+        L.y += (slot.y - L.y) * Math.min(1, dt * 9);
+      }
+      L.rot *= 0.82; L.vx = L.vy = 0;
+      L.dispSize += (TRAY_SIZE - L.dispSize) * 0.2;
+      continue;
+    }
+    L.dispSize += (L.size - L.dispSize) * 0.15;
+    // ambient broth current (fake curl noise) + viscosity + bob
+    L.vx += (Math.sin(L.y * 0.006 + t * 0.4 + L.phase) * 8) * dt;
+    L.vy += (Math.cos(L.x * 0.005 + t * 0.3 + L.phase) * 8) * dt;
+    const visc = Math.pow(0.32, dt);
+    L.vx *= visc; L.vy *= visc; L.vrot *= Math.pow(0.5, dt);
+    L.x += L.vx * dt; L.y += L.vy * dt;
+    L.rot += L.vrot * dt + Math.sin(t * 0.8 + L.phase) * 0.0015;
+    // soft walls
+    const r = letterR(L);
+    if (L.x < r) { L.x = r; L.vx = Math.abs(L.vx) * 0.5; }
+    if (L.x > W - r) { L.x = W - r; L.vx = -Math.abs(L.vx) * 0.5; }
+    if (L.y < r + 24) { L.y = r + 24; L.vy = Math.abs(L.vy) * 0.5; }
+    if (L.y > H - r) { L.y = H - r; L.vy = -Math.abs(L.vy) * 0.5; }
+  }
+  // soft collisions via a uniform spatial grid (letters number in the hundreds)
+  const CELL = 72, cols = Math.ceil(W / CELL) + 1;
+  const grid = new Map();
+  for (const L of letters) {
+    if (L.inTray) continue;
+    const key = ((L.y / CELL) | 0) * cols + ((L.x / CELL) | 0);
+    let cell = grid.get(key);
+    if (!cell) grid.set(key, cell = []);
+    cell.push(L);
+  }
+  for (const [key, cell] of grid) {
+    // this cell + right, below-left, below, below-right neighbors
+    for (const nk of [key, key + 1, key + cols - 1, key + cols, key + cols + 1]) {
+      const other = nk === key ? cell : grid.get(nk);
+      if (!other) continue;
+      for (let i = 0; i < cell.length; i++) {
+        const A = cell[i];
+        for (let j = nk === key ? i + 1 : 0; j < other.length; j++) {
+          const B = other[j];
+          const dx = B.x - A.x, dy = B.y - A.y;
+          const min = (A.r + B.r) * 0.86;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > 0.01 && d2 < min * min) {
+            const d = Math.sqrt(d2), push = (min - d) / d * 26 * dt;
+            const px = dx * push, py = dy * push;
+            if (A !== grabbed) { A.x -= px; A.y -= py; }
+            if (B !== grabbed) { B.x += px; B.y += py; }
+          }
+        }
+      }
+    }
+  }
+  for (const b of bits) {
+    b.x += Math.sin(t * 0.5 + b.phase) * b.speed * dt;
+    b.y += Math.cos(t * 0.4 + b.phase * 1.7) * b.speed * dt;
+    b.rot += 0.1 * dt;
+    b.x = (b.x + W) % W; b.y = (b.y + H) % H;
+  }
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const r = ripples[i];
+    r.r += r.v * dt; r.v *= Math.pow(0.4, dt); r.a -= 0.55 * dt;
+    if (r.a <= 0) ripples.splice(i, 1);
+  }
+}
+
+// --- render --------------------------------------------------------------------
+function drawBroth(t) {
+  ctx.fillStyle = brothGrad;
+  ctx.fillRect(0, 0, W, H);
+  // slow swirling highlight blobs (fat glistening on the surface)
+  for (let i = 0; i < 4; i++) {
+    const bx = W * (0.5 + 0.38 * Math.sin(t * 0.11 + i * 1.9));
+    const by = H * (0.5 + 0.34 * Math.cos(t * 0.09 + i * 2.6));
+    const br = Math.min(W, H) * (0.18 + 0.05 * Math.sin(t * 0.2 + i));
+    const g = ctx.createRadialGradient(bx, by, 0, bx, by, br);
+    g.addColorStop(0, 'rgba(255,190,90,0.20)');
+    g.addColorStop(1, 'rgba(255,190,90,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(bx - br, by - br, br * 2, br * 2);
+  }
+  // vignette — looking down into the bowl
+  const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.72);
+  v.addColorStop(0, 'rgba(120,45,0,0)');
+  v.addColorStop(1, 'rgba(110,40,0,0.35)');
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, W, H);
+}
+function drawBits() {
+  for (const b of bits) {
+    ctx.save();
+    ctx.translate(b.x, b.y); ctx.rotate(b.rot);
+    if (b.kind === 'carrot') {
+      ctx.fillStyle = 'rgba(232,105,20,0.85)';
+      ctx.strokeStyle = 'rgba(180,70,5,0.5)';
+      ctx.beginPath();
+      const r = b.r;
+      ctx.roundRect(-r, -r, r * 2, r * 2, r * 0.4);
+      ctx.fill(); ctx.stroke();
+    } else {
+      ctx.fillStyle = 'rgba(90,140,50,0.8)';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, b.r, b.r * 0.35, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+function drawRipples() {
+  ctx.lineWidth = 2;
+  for (const r of ripples) {
+    ctx.strokeStyle = `rgba(255,225,170,${Math.max(r.a, 0)})`;
+    ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = `rgba(255,225,170,${Math.max(r.a * 0.5, 0)})`;
+    ctx.beginPath(); ctx.arc(r.x, r.y, r.r * 0.65, 0, Math.PI * 2); ctx.stroke();
+  }
+}
+function drawLetter(L, t) {
+  if (L !== grabbed && !L.inTray) {                  // fast path: cached sprite
+    const s = letterSprite(L.ch, L.size, L.fill);
+    const scale = L.dispSize / s.size;
+    const bob = Math.sin(t * 1.4 + L.phase) * 2;
+    ctx.save();
+    ctx.translate(L.x, L.y + bob);
+    ctx.rotate(L.rot);
+    if (scale !== 1) ctx.scale(scale, scale);
+    ctx.drawImage(s.cv, -s.ox, -s.oy, s.w, s.h);
+    ctx.restore();
+    return;
+  }
+  const size = L.dispSize;
+  const w = glyphWidth(L.ch, size);              // pretext centers the glyph
+  const bob = L.inTray || L === grabbed ? 0 : Math.sin(t * 1.4 + L.phase) * 2;
+  const lift = L === grabbed ? 1 : 0;
+  ctx.save();
+  ctx.translate(L.x, L.y + bob);
+  ctx.rotate(L.rot);
+  ctx.font = `700 ${size}px ${FONT_FAMILY}`;
+  ctx.textBaseline = 'middle';
+  // depth shadow in the broth
+  ctx.fillStyle = `rgba(130,45,0,${0.30 + lift * 0.12})`;
+  ctx.fillText(L.ch, -w / 2 + 3 + lift * 5, 4 + lift * 9);
+  // pasta edge + face
+  ctx.lineWidth = Math.max(size * 0.055, 1.5);
+  ctx.strokeStyle = 'rgba(200,130,40,0.55)';
+  ctx.strokeText(L.ch, -w / 2, 0);
+  ctx.fillStyle = L.fill;
+  ctx.fillText(L.ch, -w / 2, 0);
+  // glossy highlight peeking out top-left
+  ctx.fillStyle = 'rgba(255,255,255,0.22)';
+  ctx.fillText(L.ch, -w / 2 - size * 0.02, -size * 0.035);
+  ctx.restore();
+}
+function drawHUD() {
+  // title, centered via pretext natural width
+  const titleSize = Math.min(54, W / 12);
+  const titleFont = `700 ${titleSize}px ${FONT_FAMILY}`;
+  const title = 'ALPHABET SOUP';
+  const tw = P.measureNaturalWidth(P.prepareWithSegments(title, titleFont));
+  ctx.font = titleFont;
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = 'rgba(120,42,0,0.35)';
+  ctx.fillText(title, W / 2 - tw / 2 + 2, 46 + 3);
+  ctx.fillStyle = '#fff3d6';
+  ctx.fillText(title, W / 2 - tw / 2, 46);
+  // tagline, wrapped & centered by pretext layoutWithLines
+  const tagFont = `500 15px ${FONT_FAMILY}`;
+  const tag = 'drag the letters · stir the broth · type to spell · backspace to eat · space to splash';
+  const prepared = P.prepareWithSegments(tag, tagFont);
+  const { lines } = P.layoutWithLines(prepared, Math.min(W - 48, 640), 20);
+  ctx.font = tagFont;
+  ctx.fillStyle = 'rgba(255,238,205,0.85)';
+  lines.forEach((line, i) => ctx.fillText(line.text, W / 2 - line.width / 2, H - 18 - (lines.length - 1 - i) * 20));
+  // tray pill behind the spelled word (may span multiple wrapped rows)
+  if (trayBounds) {
+    ctx.fillStyle = 'rgba(110,40,0,0.22)';
+    ctx.beginPath();
+    ctx.roundRect(trayBounds.x, trayBounds.y, trayBounds.w, trayBounds.h,
+                  Math.min(38, trayBounds.h / 2));
+    ctx.fill();
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const t = now / 1000;
+  const dt = Math.min((now - last) / 1000, 0.033);
+  last = now;
+  step(dt, t);
+  drawBroth(t);
+  drawBits();
+  drawRipples();
+  for (const L of letters) if (!L.inTray && L !== grabbed) drawLetter(L, t);
+  drawHUD();                                        // title, tagline, tray pill
+  for (const L of tray) if (L !== grabbed) drawLetter(L, t); // tray letters over pill
+  if (grabbed) drawLetter(grabbed, t);              // grabbed letter always on top
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
